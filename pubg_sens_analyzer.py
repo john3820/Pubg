@@ -1,1 +1,1 @@
-from Pubg_sens_analyzer import *  # re-export everything for Streamlit import compatibility
+import Pubg_sens_analyzer as pubg
