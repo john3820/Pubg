@@ -36,9 +36,9 @@ from matplotlib.gridspec import GridSpec
 from matplotlib import font_manager
 
 # ── 설정 ─────────────────────────────────────────────────────
-API_KEY        = "AIzaSyACliTMwFW47HOHXmC0zPigXdilPWAJ_zw"      # Google AI Studio API 키 (또는 환경변수 GEMINI_API_KEY)
+API_KEY        = ""                                              # 코드에 키를 직접 적지 말고,
                          # 무료 발급: https://aistudio.google.com/app/apikey
-GEMINI_MODEL   = os.environ.get("GEMINI_MODEL", "").strip()      # 예: gemini-2.0-flash (비워두면 자동 선택)
+GEMINI_MODEL   = "gemini-2.5-flash"                              # 기본 모델 (환경변수로 덮어쓰기 가능)
 NUM_FRAMES     = 12      # Phase 2 추출 프레임 수
 FRAME_WIDTH    = 960
 TARGET_ANGLE   = 90      # Phase 1 목표 회전각
@@ -50,48 +50,9 @@ SCRIPT_VERSION = "2026-03-13a"
 
 
 def _pick_gemini_model_name():
-    """
-    google-generativeai(v1beta)에서 generateContent 가능한 모델을 자동 선택.
-    - GEMINI_MODEL 환경변수로 강제 지정 가능 (예: gemini-2.0-flash)
-    """
-    if GEMINI_MODEL:
-        return GEMINI_MODEL
-
-    preferred = [
-        "gemini-2.0-flash",
-        "gemini-2.0-flash-lite",
-        "gemini-1.5-flash",
-        "gemini-1.5-flash-latest",
-        "gemini-1.5-pro",
-        "gemini-1.5-pro-latest",
-    ]
-
-    try:
-        models = list(genai.list_models())
-    except Exception:
-        # 목록 조회가 안 되면(권한/네트워크), 가장 흔한 기본값으로 시도
-        return "gemini-2.0-flash"
-
-    # genai.list_models()의 name은 보통 "models/xxxx"
-    available = {}
-    for m in models:
-        name = getattr(m, "name", "") or ""
-        short = name.split("/", 1)[-1] if name else ""
-        methods = set(getattr(m, "supported_generation_methods", []) or [])
-        if short:
-            available[short] = methods
-
-    for cand in preferred:
-        if "generateContent" in available.get(cand, set()):
-            return cand
-
-    # 그래도 없으면 generateContent 되는 아무 모델이나 선택
-    for short, methods in available.items():
-        if "generateContent" in methods:
-            return short
-
-    # 최후의 fallback
-    return "gemini-2.0-flash"
+    """환경변수 GEMINI_MODEL이 있으면 그것을, 없으면 기본값을 반환."""
+    env_name = os.environ.get("GEMINI_MODEL", "").strip()
+    return env_name or GEMINI_MODEL
 
 
 def _list_generatecontent_models():
@@ -296,36 +257,122 @@ def run_phase1():
 #  PHASE 2  —  수직 감도 보정 (영상 분석)
 # ════════════════════════════════════════════════════════════
 
-def extract_frames(video_path):
+def detect_muzzle_flash_frames(video_path, max_shots=15):
+    """
+    총구 불꽃(Muzzle Flash) 감지로 발사 순간 프레임 인덱스를 추출.
+    원리:
+      1. 영상을 0.25배속으로 처리 (4프레임마다 1프레임 샘플링)
+      2. 화면 중앙 영역의 밝기(평균 휘도)를 프레임별로 계산
+      3. 이전 프레임 대비 밝기가 임계값 이상 급등하면 발사로 판정
+      4. 같은 발사 이벤트 내 중복 감지 방지(MIN_SHOT_GAP 프레임 이상 간격)
+      5. 발사 직후(+1프레임)의 조준점 프레임을 기록
+    반환: 발사 순간 프레임 인덱스 목록 (최대 max_shots개)
+    """
+    SLOWMO_FACTOR   = 4      # 0.25배속 = 4프레임마다 1샘플
+    FLASH_THRESHOLD = 18     # 밝기 급등 임계값 (0~255 스케일)
+    MIN_SHOT_GAP    = 6      # 같은 발사로 묶는 최소 프레임 간격
+    CENTER_RATIO    = 0.25   # 중앙 영역 크기 비율 (화면의 25%)
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return []
+
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    w     = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h     = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    cx, cy = w // 2, h // 2
+    roi_w  = int(w * CENTER_RATIO)
+    roi_h  = int(h * CENTER_RATIO)
+    x1, y1 = cx - roi_w // 2, cy - roi_h // 2
+    x2, y2 = cx + roi_w // 2, cy + roi_h // 2
+
+    brightness_history = []
+    for idx in range(0, total, SLOWMO_FACTOR):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ret, frame = cap.read()
+        if not ret:
+            break
+        roi  = frame[y1:y2, x1:x2]
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        brightness_history.append((idx, float(gray.mean())))
+    cap.release()
+
+    if len(brightness_history) < 2:
+        return []
+
+    shot_frames  = []
+    last_shot_at = -MIN_SHOT_GAP * 10
+    for i in range(1, len(brightness_history)):
+        idx_cur,  b_cur  = brightness_history[i]
+        idx_prev, b_prev = brightness_history[i - 1]
+        delta = b_cur - b_prev
+        if delta >= FLASH_THRESHOLD:
+            if idx_cur - last_shot_at >= MIN_SHOT_GAP * SLOWMO_FACTOR:
+                capture_idx = brightness_history[min(i + 1, len(brightness_history)-1)][0]
+                shot_frames.append(capture_idx)
+                last_shot_at = idx_cur
+                if len(shot_frames) >= max_shots:
+                    break
+    return shot_frames
+
+
+def extract_frames(video_path, max_shots=15):
+    """
+    총구 불꽃 감지로 발사 순간 프레임을 추출.
+    감지 실패 시 균등 간격 추출로 자동 폴백.
+    반환: (frames_b64_list, shot_frame_indices)
+    """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         print(f"[!] 영상 열기 실패: {video_path}")
         sys.exit(1)
+
     total    = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps      = cap.get(cv2.CAP_PROP_FPS)
     w        = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h        = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     duration = total / fps if fps > 0 else 0
-    print(f"  해상도: {w}x{h}  FPS: {fps:.1f}  길이: {duration:.1f}초  프레임: {total}")
-
-    indices = [int(total * i / max(NUM_FRAMES-1,1)) for i in range(NUM_FRAMES)]
-    indices = [min(i, total-1) for i in indices]
-    new_h   = int(h * FRAME_WIDTH / w)
-    out     = []
-    for idx in indices:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-        ret, frame = cap.read()
-        if not ret: continue
-        frame = cv2.resize(frame, (FRAME_WIDTH, new_h))
-        _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-        out.append(base64.b64encode(buf.tobytes()).decode("ascii"))
+    new_h    = int(h * FRAME_WIDTH / w)
     cap.release()
-    print(f"  프레임 {len(out)}장 추출 완료")
-    return out
+
+    print(f"  해상도: {w}x{h}  FPS: {fps:.1f}  길이: {duration:.1f}초  프레임: {total}")
+    print("  총구 불꽃 감지 중 (0.25배속 처리)...")
+    shot_indices = detect_muzzle_flash_frames(video_path, max_shots=max_shots)
+
+    if len(shot_indices) >= 3:
+        print(f"  발사 감지: {len(shot_indices)}발  프레임: {shot_indices[:5]}{'...' if len(shot_indices)>5 else ''}")
+        indices = shot_indices
+        detected = True
+    else:
+        print(f"  [!] 발사 감지 부족({len(shot_indices)}발) → 균등 간격으로 대체")
+        n       = min(max_shots, NUM_FRAMES)
+        indices = [int(total * i / max(n-1, 1)) for i in range(n)]
+        indices = [min(i, total-1) for i in indices]
+        detected = False
+
+    cap2 = cv2.VideoCapture(video_path)
+    out  = []
+    for idx in indices:
+        cap2.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ret, frame = cap2.read()
+        if not ret:
+            continue
+        frame = cv2.resize(frame, (FRAME_WIDTH, new_h))
+        _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 82])
+        out.append(base64.b64encode(buf.tobytes()).decode("ascii"))
+    cap2.release()
+
+    print(f"  프레임 {len(out)}장 추출 완료 ({'발사 감지' if detected else '균등 간격'})")
+    return out, (shot_indices if detected else [])
 
 
-def analyze_recoil(model, frames_b64):
-    # base64 → PIL Image 형태로 Gemini에 전달
+def analyze_recoil(model, frames_b64, shot_indices=None):
+    """
+    발사 순간 프레임들을 AI에 전달해 탄착 궤적 분석.
+    frames_b64: 발사 감지로 추출된 프레임 base64 목록
+    shot_indices: 발사 프레임 번호 목록 (표시용)
+    """
     import PIL.Image, io
 
     images = []
@@ -333,36 +380,56 @@ def analyze_recoil(model, frames_b64):
         img_bytes = base64.b64decode(b64)
         images.append(PIL.Image.open(io.BytesIO(img_bytes)))
 
-    prompt = f"""이 이미지는 PUBG 훈련장에서 벽을 향해 에임 고정 후 연속 발사하는 영상 프레임 {len(images)}장입니다 (시간 순).
+    n_shots = len(images)
+    shot_info = f"{n_shots}발" if shot_indices else f"프레임 {n_shots}장"
 
-분석 목표: 마우스 미사용 상태에서 반동으로 인한 조준점 수직/수평 이동량 추적.
+    prompt = f"""이 이미지들은 PUBG 훈련장에서 총구 불꽃 감지로 추출한 실제 발사 순간 프레임 {n_shots}장입니다.
+각 이미지는 1발 발사 직후의 화면이며, 순서대로 1발~{n_shots}발입니다.
+
+분석 목표:
+마우스를 전혀 움직이지 않은 상태에서 총기 반동으로 인해
+각 발사 후 화면 중앙의 조준점(크로스헤어)이 이전 발사 대비 얼마나 이동했는지 추적하세요.
 
 분석 항목:
-1. 프레임별 조준점 이동 (첫 프레임 기준 X,Y px, Y양수=위/음수=아래, X양수=우/음수=좌)
-2. 수직 드리프트 총량(px) 및 방향 ("상단이탈"/"하단이탈"/"안정")
-3. 수평 드리프트 총량(px) 및 방향 ("좌이탈"/"우이탈"/"안정")
-4. 반동 패턴 ("vertical_heavy"/"horizontal_heavy"/"spread"/"stable")
+1. 발사별 조준점 위치 (1발 기준 상대 좌표, px 단위 추정)
+   Y양수=위쪽 이동(총구 상탄), Y음수=아래쪽 이동, X양수=우측, X음수=좌측
+2. 전체 수직 드리프트 총량(px) 및 방향 ("상단이탈"/"하단이탈"/"안정")
+3. 전체 수평 드리프트 총량(px) 및 방향 ("좌이탈"/"우이탈"/"안정")
+4. 반동 패턴 유형:
+   "vertical_heavy": 수직 지배적, "horizontal_heavy": 수평 지배적,
+   "spread": 불규칙 퍼짐, "stable": 안정적
 5. 현재 수직 배수 {CURRENT_VMULT} 기준 추천 수직 배수 (0.5~2.0)
-6. 신뢰도 ("high"/"medium"/"low")
+6. 분석 신뢰도: "high"/"medium"/"low"
 
 JSON만 응답 (다른 텍스트 없이):
 {{
-  "frame_trajectory": [{{"frame":0,"x":0,"y":0}}, ...],
-  "vertical_drift_px": <number>,
-  "horizontal_drift_px": <number>,
+  "shot_trajectory": [
+    {{"shot": 1, "x": 0, "y": 0}},
+    {{"shot": 2, "x": <number>, "y": <number>}},
+    ...
+  ],
+  "vertical_drift_px": <전체 수직 이동량, 양수>,
+  "horizontal_drift_px": <전체 수평 이동량, 양수>,
   "drift_direction_v": <"상단이탈"|"하단이탈"|"안정">,
   "drift_direction_h": <"좌이탈"|"우이탈"|"안정">,
   "recoil_pattern": <"vertical_heavy"|"horizontal_heavy"|"spread"|"stable">,
   "recommended_vertical_mult": <number>,
   "confidence": <"high"|"medium"|"low">,
-  "note": "<한국어 메모>"
+  "note": "<한국어로 발사 패턴 특징 메모>"
 }}"""
 
-    print("  Gemini API — 반동 궤적 분석 중...")
+    print("  Gemini API — 발사별 반동 궤적 분석 중...")
     resp, model = _generate_with_fallback(model, [prompt] + images)
     raw  = resp.text.replace("```json","").replace("```","").strip()
     try:
-        return json.loads(raw)
+        result = json.loads(raw)
+        # shot_trajectory → frame_trajectory 로 통일 (하위 호환)
+        if "shot_trajectory" in result and "frame_trajectory" not in result:
+            result["frame_trajectory"] = [
+                {"frame": s["shot"]-1, "x": s["x"], "y": s["y"]}
+                for s in result["shot_trajectory"]
+            ]
+        return result
     except json.JSONDecodeError:
         print(f"[!] 파싱 실패:\n{raw}")
         return None
@@ -430,14 +497,14 @@ def run_phase2(model):
         pass
 
     print(f"\n{DIVIDER}")
-    print("  [1/3] 프레임 추출 중...")
+    print("  [1/3] 총구 불꽃 감지 + 프레임 추출 중...")
     print(DIVIDER)
-    frames = extract_frames(video_path)
+    frames, shot_indices = extract_frames(video_path)
 
     print(f"\n{DIVIDER}")
-    print("  [2/3] 반동 궤적 분석 중...")
+    print("  [2/3] 발사별 반동 궤적 분석 중...")
     print(DIVIDER)
-    result = analyze_recoil(model, frames)
+    result = analyze_recoil(model, frames, shot_indices)
     if not result:
         print("[!] 분석 실패.")
         return None, None, video_path
@@ -590,8 +657,15 @@ def draw_combined_graph(p1, p2_result, p2_report, save_path):
                             fontsize=10, color=TXT2, va="center")
             ax_p1_card.text(0.62, y, val, transform=ax_p1_card.transAxes,
                             fontsize=14, fontweight="bold", color=color, va="center")
-            ax_p1_card.axhline(y - 0.10, xmin=0.02, xmax=0.98,
-                               color=GRID, linewidth=0.6, transform=ax_p1_card.transAxes)
+            # axhline은 transform 인자를 허용하지 않는 버전이 있어 plot으로 대체
+            ax_p1_card.plot(
+                [0.02, 0.98],
+                [y - 0.10, y - 0.10],
+                color=GRID,
+                linewidth=0.6,
+                transform=ax_p1_card.transAxes,
+                clip_on=False,
+            )
 
     if not has_p2:
         plt.savefig(save_path, dpi=150, bbox_inches="tight", facecolor=BG)
@@ -600,15 +674,16 @@ def draw_combined_graph(p1, p2_result, p2_report, save_path):
         return
 
     # ────────── PHASE 2 그래프 ──────────
-    traj = p2_result.get("frame_trajectory", [])
+    # shot_trajectory 우선, 없으면 frame_trajectory 사용
+    traj = p2_result.get("shot_trajectory", p2_result.get("frame_trajectory", []))
     xs   = [p["x"] for p in traj]
     ys   = [-p["y"] for p in traj]   # Y 반전: 위=화면상 아래
-    fi   = list(range(len(traj)))
+    fi   = list(range(1, len(traj)+1))   # 1발~N발
 
     # P2-1: 탄착 궤적
     ax_traj = fig.add_subplot(gs[0, 1])
     ax_traj.set_facecolor(PANEL)
-    ax_traj.set_title("Phase 2 — 탄착 궤적", color=ORA, fontsize=11, pad=8)
+    ax_traj.set_title("Phase 2 — 탄착 궤적 (총구 불꽃 감지)", color=ORA, fontsize=11, pad=8)
 
     if len(xs) >= 2:
         for i in range(len(xs)-1):
@@ -618,8 +693,13 @@ def draw_combined_graph(p1, p2_result, p2_report, save_path):
         sc = ax_traj.scatter(xs, ys, c=fi, cmap="YlOrRd",
                              s=55, zorder=5, edgecolors=TXT2, linewidths=0.4)
         cb = plt.colorbar(sc, ax=ax_traj, pad=0.02)
-        cb.set_label("프레임", color=TXT2, fontsize=7)
+        cb.set_label("발수", color=TXT2, fontsize=7)
         plt.setp(cb.ax.yaxis.get_ticklabels(), color=TXT2, fontsize=7)
+        # 발수 번호 주석
+        for shot_i, (sx, sy) in enumerate(zip(xs, ys)):
+            ax_traj.annotate(str(shot_i+1), (sx, sy),
+                             textcoords="offset points", xytext=(4, 4),
+                             fontsize=6, color=TXT2, zorder=6)
 
     ax_traj.scatter([0], [0], color=GRN, s=120, zorder=10, marker="*", label="첫 발")
     ax_traj.axhline(0, color=TXT2, linewidth=0.5, linestyle="--", alpha=0.5)
@@ -632,7 +712,7 @@ def draw_combined_graph(p1, p2_result, p2_report, save_path):
     # P2-2: 수직 드리프트 시계열
     ax_v = fig.add_subplot(gs[0, 2])
     ax_v.set_facecolor(PANEL)
-    ax_v.set_title("Phase 2 — 수직 드리프트", color=ORA, fontsize=11, pad=8)
+    ax_v.set_title("Phase 2 — 수직 드리프트 (발수별)", color=ORA, fontsize=11, pad=8)
     if ys:
         ax_v.plot(fi, ys, color=RED, linewidth=2, marker="o", markersize=4)
         ax_v.fill_between(fi, ys, 0, where=[y<0 for y in ys],
@@ -640,15 +720,17 @@ def draw_combined_graph(p1, p2_result, p2_report, save_path):
         ax_v.fill_between(fi, ys, 0, where=[y>=0 for y in ys],
                           color=BLU, alpha=0.15, label="하탄")
         ax_v.axhline(0, color=TXT2, linewidth=0.8, linestyle="--")
+        ax_v.set_xticks(fi)
+        ax_v.set_xticklabels([f"{i}발" for i in fi], fontsize=6, rotation=45)
         ax_v.legend(fontsize=8, facecolor=PANEL, edgecolor=TXT2, labelcolor=TXT)
-    ax_v.set_xlabel("프레임", fontsize=8)
+    ax_v.set_xlabel("발수", fontsize=8)
     ax_v.set_ylabel("이동량 (px)", fontsize=8)
     ax_v.grid(True, alpha=0.4)
 
     # P2-3: 수평 드리프트 시계열
     ax_h = fig.add_subplot(gs[0, 3])
     ax_h.set_facecolor(PANEL)
-    ax_h.set_title("Phase 2 — 수평 드리프트", color=ORA, fontsize=11, pad=8)
+    ax_h.set_title("Phase 2 — 수평 드리프트 (발수별)", color=ORA, fontsize=11, pad=8)
     if xs:
         ax_h.plot(fi, xs, color=BLU, linewidth=2, marker="o", markersize=4)
         ax_h.fill_between(fi, xs, 0, where=[x>0 for x in xs],
@@ -656,8 +738,10 @@ def draw_combined_graph(p1, p2_result, p2_report, save_path):
         ax_h.fill_between(fi, xs, 0, where=[x<=0 for x in xs],
                           color=GRN, alpha=0.15, label="좌이탈")
         ax_h.axhline(0, color=TXT2, linewidth=0.8, linestyle="--")
+        ax_h.set_xticks(fi)
+        ax_h.set_xticklabels([f"{i}발" for i in fi], fontsize=6, rotation=45)
         ax_h.legend(fontsize=8, facecolor=PANEL, edgecolor=TXT2, labelcolor=TXT)
-    ax_h.set_xlabel("프레임", fontsize=8)
+    ax_h.set_xlabel("발수", fontsize=8)
     ax_h.set_ylabel("이동량 (px)", fontsize=8)
     ax_h.grid(True, alpha=0.4)
 
